@@ -49,12 +49,16 @@ class TaskQueue(collections.deque):
         collections.deque.append(self, item)
         self.counter += 1
 
+    def pop(self):
+        self.counter -= 1
+        return collections.deque.pop(self)
+
 
 class BaseTaskHandler(tornado.web.RequestHandler):
-    def initialize(self, queue, pool=None):
+    def initialize(self, queue, pool=None, gpuids=None):
         self.queue = queue
         self.pool = pool
-
+        self.gpuids = gpuids
 
 class AddTaskHandler(BaseTaskHandler):
     def get(self, taskfile):
@@ -66,7 +70,7 @@ class AddTaskHandler(BaseTaskHandler):
         }
         logger.info("Task added: {}".format(taskfile))
 
-        fut = self.pool.submit(worker, taskfile)
+        fut = self.pool.submit(worker, taskfile, self.gpuids)
         task['taskworker'] = fut
         self.queue.append(task)
 
@@ -117,11 +121,17 @@ class Scheduler(tornado.web.Application):
     """
     RESTful scheduler
     """
-    def __init__(self, queue, workers=None):
+    def __init__(self, queue, workers=None, gpuids=None):
         self.queue = queue
         self.pool = ProcessPoolExecutor(max_workers=workers)
+        if gpuids != None:
+            self.gpuids = TaskQueue()#list(gpuids.split(','))
+            for gpuid in list(gpuids.split(',')):
+                self.gpuids.append(gpuid)
+        else:
+            self.gpuids = None
         handlers = [
-            (r"/add/(.*)", AddTaskHandler, {'queue': queue, 'pool': self.pool}),
+            (r"/add/(.*)", AddTaskHandler, {'queue': queue, 'pool': self.pool, 'gpuids' : self.gpuids}),
             (r"/list", ListTaskHandler, {'queue': queue}),
             (r"/task/([0-9]+)", TaskByIdHandler, {'queue': queue}),
         ]
@@ -138,17 +148,24 @@ class Scheduler(tornado.web.Application):
                 logger.info("Task ID {} {}".format(task['taskid'], task['taskstatus']))
 
 
-def worker(taskfile):
+def worker(taskfile, gpuids=None):
     try:
-        call(['cd {}; /bin/bash {} &> {}.out'.format(dirname(taskfile), taskfile, basename_noext(taskfile))], shell=True )
+        f = open('{}.out'.format(basename_noext(taskfile)),'wb')
+        if gpuids != None:
+            gpuid = gpuids.pop()
+            call(['cd {}; /bin/bash {}'.format(dirname(taskfile), taskfile)], stdout=f, stderr=f, shell=True, env={'GMX_GPU_ID': gpuid} )
+            gpuids.append(gpuid)
+        else:
+            call(['cd {}; /bin/bash {}'.format(dirname(taskfile), taskfile)], stdout=f, stderr=f, shell=True)
+        f.close()
         return DONE
     except:
         logger.error("Taskfile FAILED: {}".format(taskfile))
         return FAILED
 
-def main(port, address, workers):
+def main(port, gpuids, address, workers):
     queue = TaskQueue()
-    app = Scheduler(queue, workers)
+    app = Scheduler(queue, workers, gpuids)
     sockets = tornado.netutil.bind_sockets(port, address=address)
     server = tornado.httpserver.HTTPServer(app)
     server.add_sockets(sockets)
@@ -189,8 +206,16 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--workers', type=int, default=1, help="Number of workers (default: Number of processors)")
+    parser.add_argument('--gpuids', default=None, help="List of available GPU ID's in comma-separated format e.g. 0,1; must be equal in number to the number of workers (default: None)")
     parser.add_argument('--address', default=None, help='Task scheduler address (default: all localhost IP address)')
     parser.add_argument('--port', default=8082, help='Task scheduler port (default: 8082)')
     args = parser.parse_args()
+    if args.gpuids != None:
+        try:
+            assert len(args.gpuids.split(',')) == args.workers
+        except:
+            logger.info(parser.print_help())
+            sys.exit(0)
+            
 
-    main(args.port, args.address, args.workers)
+    main(args.port, args.gpuids, args.address, args.workers)
